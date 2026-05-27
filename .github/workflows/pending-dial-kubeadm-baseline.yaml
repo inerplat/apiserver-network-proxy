@@ -1,0 +1,87 @@
+name: pending-dial-kubeadm-baseline
+
+on:
+  push:
+    branches:
+    - ci/reproduce-pending-dial-baseline
+  workflow_dispatch:
+
+env:
+  BASEIMAGE: gcr.io/distroless/static-debian12
+  GO_TOOLCHAIN: golang
+  CLUSTER_NAME: pending-dial-kubeadm
+  NODE_IMAGE: kindest/node:v1.34.3
+  KUBERNETES_VERSION: v1.34.3
+  KUBECONFIG_PATH: /tmp/pending-dial-kubeadm-kubeconfig
+  REGISTRY: gcr.io/k8s-staging-kas-network-proxy
+  TAG: pending-dial
+
+jobs:
+  reproduce:
+    name: unpatched kubeadm reproduction
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+    - name: Check out code
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+    - name: Set up Go
+      uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+      with:
+        go-version-file: go.mod
+
+    - name: Install kubectl
+      run: |
+        curl -Lo ./kubectl https://dl.k8s.io/${KUBERNETES_VERSION}/bin/linux/amd64/kubectl
+        chmod +x ./kubectl
+        sudo mv ./kubectl /usr/local/bin/kubectl
+
+    - name: Pull kindest node image
+      run: docker pull ${NODE_IMAGE}
+
+    - name: Build local images
+      run: |
+        make docker-build/proxy-agent-amd64 REGISTRY=${REGISTRY} TAG=local BASEIMAGE=${BASEIMAGE}
+        docker tag ${REGISTRY}/proxy-agent-amd64:local ${REGISTRY}/proxy-agent:${TAG}
+        make docker-build/proxy-server-amd64 REGISTRY=${REGISTRY} TAG=local BASEIMAGE=${BASEIMAGE}
+        docker tag ${REGISTRY}/proxy-server-amd64:local ${REGISTRY}/proxy-server:${TAG}
+        make docker-build/proxy-test-client REGISTRY=${REGISTRY} TAG=local BASEIMAGE=${BASEIMAGE}
+        docker tag ${REGISTRY}/proxy-test-client-amd64:local ${REGISTRY}/proxy-test-client:${TAG}
+        make docker-build/http-test-server REGISTRY=${REGISTRY} TAG=local BASEIMAGE=${BASEIMAGE}
+        docker tag ${REGISTRY}/http-test-server-amd64:local ${REGISTRY}/http-test-server:${TAG}
+
+    - name: Run kubeadm pending dial reproduction
+      env:
+        SERVER_IMAGE: ${{ env.REGISTRY }}/proxy-server:${{ env.TAG }}
+        AGENT_IMAGE: ${{ env.REGISTRY }}/proxy-agent:${{ env.TAG }}
+        TEST_CLIENT_IMAGE: ${{ env.REGISTRY }}/proxy-test-client:${{ env.TAG }}
+        TEST_SERVER_IMAGE: ${{ env.REGISTRY }}/http-test-server:${{ env.TAG }}
+      run: hack/ci/pending-dial-kubeadm.sh
+
+    - name: Export kubeadm cluster logs
+      if: always()
+      run: |
+        mkdir -p _artifacts/kubeadm-cluster
+        for node in ${CLUSTER_NAME}-cp ${CLUSTER_NAME}-w1 ${CLUSTER_NAME}-w2; do
+          docker logs "$node" > "_artifacts/kubeadm-cluster/${node}.docker.log" 2>&1 || true
+          docker exec "$node" journalctl --no-pager > "_artifacts/kubeadm-cluster/${node}.journal.log" 2>&1 || true
+          docker exec "$node" crictl ps -a > "_artifacts/kubeadm-cluster/${node}.crictl-ps.txt" 2>&1 || true
+        done
+        if [ -f "${KUBECONFIG_PATH}" ]; then
+          kubectl --kubeconfig "${KUBECONFIG_PATH}" get nodes -o wide > _artifacts/kubeadm-cluster/nodes.txt 2>&1 || true
+          kubectl --kubeconfig "${KUBECONFIG_PATH}" get pods -A -o wide > _artifacts/kubeadm-cluster/pods.txt 2>&1 || true
+          kubectl --kubeconfig "${KUBECONFIG_PATH}" get events -A --sort-by=.lastTimestamp > _artifacts/kubeadm-cluster/events.txt 2>&1 || true
+          kubectl --kubeconfig "${KUBECONFIG_PATH}" -n kube-system describe deployment coredns > _artifacts/kubeadm-cluster/coredns-describe.txt 2>&1 || true
+          kubectl --kubeconfig "${KUBECONFIG_PATH}" -n kube-system describe ds konnectivity-server > _artifacts/kubeadm-cluster/konnectivity-server-describe.txt 2>&1 || true
+          kubectl --kubeconfig "${KUBECONFIG_PATH}" -n kube-system describe ds konnectivity-agent > _artifacts/kubeadm-cluster/konnectivity-agent-describe.txt 2>&1 || true
+          kubectl --kubeconfig "${KUBECONFIG_PATH}" -n kube-system logs -l k8s-app=konnectivity-server --tail=300 > _artifacts/kubeadm-cluster/konnectivity-server.log 2>&1 || true
+          kubectl --kubeconfig "${KUBECONFIG_PATH}" -n kube-system logs -l k8s-app=konnectivity-agent --tail=300 > _artifacts/kubeadm-cluster/konnectivity-agent.log 2>&1 || true
+          curl -fsS "http://127.0.0.1:18093/metrics" > _artifacts/kubeadm-cluster/konnectivity-metrics.txt 2>&1 || true
+        fi
+
+    - name: Upload kubeadm cluster logs
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: pending-dial-kubeadm-baseline-logs-${{ github.run_id }}
+        path: ./_artifacts/kubeadm-cluster

@@ -20,6 +20,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -53,17 +54,21 @@ func main() {
 }
 
 type TestServerRunOptions struct {
+	// Address we listen for server connections on.
+	serverBindAddress string
 	// Port we listen for server connections on.
 	serverPort uint
 }
 
 func (o *TestServerRunOptions) Flags() *pflag.FlagSet {
 	flags := pflag.NewFlagSet("proxy-server", pflag.ContinueOnError)
+	flags.StringVar(&o.serverBindAddress, "server-bind-address", o.serverBindAddress, "Address we listen for server connections on.")
 	flags.UintVar(&o.serverPort, "server-port", o.serverPort, "Port we listen for server connections on. Set to 0 for UDS.")
 	return flags
 }
 
 func (o *TestServerRunOptions) Print() {
+	klog.Warningf("Server bind address set to %q.\n", o.serverBindAddress)
 	klog.Warningf("Server port set to %d.\n", o.serverPort)
 }
 
@@ -80,7 +85,8 @@ func (o *TestServerRunOptions) Validate() error {
 
 func newTestServerRunOptions() *TestServerRunOptions {
 	o := TestServerRunOptions{
-		serverPort: 8000,
+		serverBindAddress: "127.0.0.1",
+		serverPort:        8000,
 	}
 	return &o
 }
@@ -194,7 +200,7 @@ func (p *TestServer) runTestServer(ctx context.Context, o *TestServerRunOptions)
 	muxHandler.HandleFunc("/error", returnError)
 	muxHandler.HandleFunc("/close", closeNoResponse)
 	server := &http.Server{
-		Addr:              fmt.Sprintf("127.0.0.1:%d", o.serverPort),
+		Addr:              net.JoinHostPort(o.serverBindAddress, strconv.FormatUint(uint64(o.serverPort), 10)),
 		Handler:           muxHandler,
 		MaxHeaderBytes:    1 << 20,
 		ReadHeaderTimeout: 60 * time.Second,
